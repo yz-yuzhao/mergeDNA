@@ -26,6 +26,7 @@ from mergedna.modules.grouping_head import GroupingHead
 from mergedna.modules.merge import (
     all_pairs_match_window,
     apply_merge_plan,
+    soft_apply_merge_window,
     update_positions,
 )
 from mergedna.modules.source_map import SourceMap
@@ -94,7 +95,20 @@ class LocalEncoder(nn.Module):
             )
             # Update positions using *old* sizes before reassigning.
             positions = update_positions(positions, size, plan)
-            x, size = apply_merge_plan(x, size, plan)
+            x_hard, size_new = apply_merge_plan(x, size, plan)
+            # STE bridge — gives the grouping head a gradient path. Forward
+            # value is unchanged (x_soft - x_soft.detach() == 0); backward
+            # routes through x_soft, which depends continuously on `metric`.
+            if self.training and r_schedule[i] > 0:
+                x_soft = soft_apply_merge_window(
+                    x=x, size=size, metric=metric,
+                    r=r_schedule[i], W=self.cfg.window_size,
+                    valid=token_mask, plan=plan,
+                )
+                x = x_hard + (x_soft - x_soft.detach())
+            else:
+                x = x_hard
+            size = size_new
             source_map = source_map.apply_merge(plan)
             token_mask = source_map.token_mask
 

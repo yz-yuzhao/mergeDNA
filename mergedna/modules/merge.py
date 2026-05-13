@@ -109,6 +109,152 @@ def apply_merge_plan(
     return out, plan.new_size.clone()
 
 
+def soft_apply_merge_window(
+    x: torch.Tensor,
+    size: torch.Tensor,
+    metric: torch.Tensor,
+    r: int,
+    W: int,
+    valid: torch.Tensor,
+    plan: MergePlan,
+    tau: float = 0.1,
+) -> torch.Tensor:
+    """DTEM-style soft surrogate for ``apply_merge_plan(x, size, plan)[0]``.
+
+    Used as the differentiable branch of a straight-through estimator:
+
+        x_out = x_hard + x_soft - x_soft.detach()
+
+    Forward value is exactly ``x_hard`` (the bracketed difference is identically
+    zero), but the autograd graph runs through ``x_soft``, which depends on
+    ``metric`` via continuous soft pair selection. This is what gives the
+    grouping head a gradient signal — without it, the hard top-r in
+    :func:`all_pairs_match_window` returns only integer indices and the head
+    is stranded off the training path.
+
+    Mechanism (DTEM §3.2-3.3, adapted to all-pairs-within-window):
+
+      1. Pair scores are the cosine similarities of ``metric`` restricted to the
+         strict upper triangle within each window.
+      2. Iterated soft-argmax with suppression: for ``t = 1..r_per_window``,
+         compute ``A^t = softmax((S^t) / τ)`` and accumulate it into a soft
+         pair-indicator ``E~ ∈ [0,1]^{num_pairs}``. After each step we suppress
+         the endpoints of softly-selected pairs by subtracting
+         ``SUPPRESS * (u_i + u_j)`` from ``S^{t+1}``, so subsequent steps pick
+         disjoint pairs (mimicking the "each token in ≤ 1 pair" rule).
+      3. Soft merging: each old position ``k`` keeps fraction ``1 - outgoing[k]``
+         of its mass and absorbs ``Σ_b E~_{k,b} · size[b]`` mass from
+         higher-indexed partners. The resulting size-weighted features are
+         aggregated into the new layout via ``plan.old_to_new``.
+
+    In the discrete limit (``E~`` matching the hard plan exactly), the output
+    equals ``apply_merge_plan``'s exactly, so the STE bridge has zero forward
+    bias.
+
+    Args:
+        x:       ``[B, L, D]`` features (pre-merge).
+        size:    ``[B, L]`` current sizes (pre-merge).
+        metric:  ``[B, L, D_metric]`` grouping-head output.
+        r:       total tokens to remove (same budget as the hard plan).
+        W:       window size.
+        valid:   ``[B, L]`` BoolTensor.
+        plan:    the hard ``MergePlan`` returned by ``all_pairs_match_window``.
+        tau:     softmax temperature for the soft-argmax (DTEM default 0.1).
+    """
+    if x.dim() != 3:
+        raise ValueError(f"x must be 3-D, got shape {tuple(x.shape)}")
+    B, L, D = x.shape
+    device = x.device
+    dtype = x.dtype
+
+    metric_p, _ = pad_to_multiple(metric, W, dim=1, value=0.0)
+    valid_p, _ = pad_to_multiple(valid, W, dim=1, value=False)
+    x_p, _ = pad_to_multiple(x, W, dim=1, value=0.0)
+    size_p, _ = pad_to_multiple(size, W, dim=1, value=0)
+    L_pad = metric_p.shape[1]
+    n_w = L_pad // W
+
+    m_w = metric_p.view(B, n_w, W, -1)
+    valid_w = valid_p.view(B, n_w, W)
+    x_w = x_p.view(B, n_w, W, D)
+    size_w = size_p.view(B, n_w, W).to(dtype)
+
+    m_norm = F.normalize(m_w, dim=-1, eps=1e-8)
+    sim = m_norm @ m_norm.transpose(-1, -2)                # [B, n_w, W, W]
+
+    pair_i, pair_j = torch.triu_indices(W, W, offset=1, device=device).unbind(0)
+    num_pairs = pair_i.shape[0]
+    pair_scores = sim[:, :, pair_i, pair_j]                # [B, n_w, num_pairs]
+    pair_valid = valid_w[:, :, pair_i] & valid_w[:, :, pair_j]
+    # Large finite negative so softmax stays well-defined for invalid pairs.
+    NEG = -1e4
+    pair_scores = torch.where(pair_valid, pair_scores, torch.full_like(pair_scores, NEG))
+
+    base, rem = divmod(r, max(n_w, 1))
+    r_per_window = torch.full((n_w,), base, dtype=torch.long, device=device)
+    r_per_window[:rem] += 1
+    r_max = int(r_per_window.max().item()) if n_w > 0 else 0
+
+    E_pair = torch.zeros(B, n_w, num_pairs, device=device, dtype=dtype)
+
+    if r_max > 0:
+        used_node = torch.zeros(B, n_w, W, device=device, dtype=dtype)
+        pair_i_b = pair_i.view(1, 1, -1).expand(B, n_w, num_pairs)
+        pair_j_b = pair_j.view(1, 1, -1).expand(B, n_w, num_pairs)
+        # active[t, w]: 1 if this window still has budget at step t.
+        steps = torch.arange(r_max, device=device).unsqueeze(1)        # [r_max, 1]
+        active_mask = (steps < r_per_window.unsqueeze(0)).to(dtype)    # [r_max, n_w]
+        # Suppression strength: with τ=0.1 and similarities in [-1, 1], setting
+        # SUPPRESS=10 multiplies an already-used pair's softmax exponent by
+        # exp(-100), which is more than enough to zero its probability.
+        SUPPRESS = 10.0
+
+        for t in range(r_max):
+            u_i = used_node.gather(dim=2, index=pair_i_b)
+            u_j = used_node.gather(dim=2, index=pair_j_b)
+            s_t = pair_scores - SUPPRESS * (u_i + u_j)
+            a_t = F.softmax(s_t / tau, dim=-1) * active_mask[t].view(1, n_w, 1)
+            E_pair = E_pair + a_t
+            # Out-of-place updates — autograd needs to read prior `used_node`
+            # states in subsequent iterations, which the in-place form would
+            # invalidate (version-counter mismatch on ScatterAddBackward).
+            used_node = used_node.scatter_add(2, pair_i_b, a_t)
+            used_node = used_node.scatter_add(2, pair_j_b, a_t)
+
+    E_pair = E_pair.clamp(0.0, 1.0)
+
+    # Soft adjacency in [B, n_w, W, W] (strict upper triangle). Built via
+    # out-of-place scatter to keep the autograd graph clean.
+    flat_idx = (pair_i * W + pair_j).view(1, 1, -1).expand(B, n_w, num_pairs)
+    E_full = torch.zeros(B, n_w, W * W, device=device, dtype=dtype).scatter_add(
+        2, flat_idx, E_pair
+    ).view(B, n_w, W, W)
+
+    # outgoing[k] = Σ_{a < k} E_full[a, k]; mass position k loses to lower keepers.
+    # incoming via einsum over upper-triangle: each i absorbs Σ_{j > i} E_full[i, j] · size[j] · x[j].
+    sized_x = size_w.unsqueeze(-1) * x_w                               # [B, n_w, W, D]
+    x_incoming = torch.einsum("bwij,bwjd->bwid", E_full, sized_x)      # [B, n_w, W, D]
+    size_incoming = torch.einsum("bwij,bwj->bwi", E_full, size_w)      # [B, n_w, W]
+    outgoing = E_full.sum(dim=-2)                                      # [B, n_w, W]
+    frac_remain = (1.0 - outgoing).clamp_min(0.0)
+    size_remain = frac_remain * size_w
+    size_soft = size_remain + size_incoming
+    x_soft_pos = (size_remain.unsqueeze(-1) * x_w + x_incoming) / size_soft.clamp_min(1e-8).unsqueeze(-1)
+
+    # Project to [B, L_new_max, D] via the hard plan, size-weighted by soft mass.
+    x_soft_flat = x_soft_pos.view(B, L_pad, D)[:, :L, :].contiguous()
+    size_soft_flat = size_soft.view(B, L_pad)[:, :L].contiguous()
+
+    L_new_max = plan.L_new_max
+    weighted = x_soft_flat * size_soft_flat.unsqueeze(-1)
+    out_num = torch.zeros(B, L_new_max, D, device=device, dtype=dtype)
+    idx = plan.old_to_new.unsqueeze(-1).expand(-1, -1, D)
+    out_num.scatter_add_(dim=1, index=idx, src=weighted)
+    out_den = torch.zeros(B, L_new_max, device=device, dtype=dtype)
+    out_den.scatter_add_(dim=1, index=plan.old_to_new, src=size_soft_flat)
+    return out_num / out_den.clamp_min(1e-8).unsqueeze(-1)
+
+
 def all_pairs_match_window(
     metric: torch.Tensor,
     size: torch.Tensor,
